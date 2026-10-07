@@ -3555,6 +3555,9 @@ end
 --- @field Callback function -- If set, the serialized data will be sent to the callback function instead of to file. ___Default:___ false
 --- @field mode string -- Valid modes: full, optimized, scripts. Change this to invalid mode like "invalid" if you only want ExtraInstances. "optimized" mode is **NOT** supported with *@Object* option. ___Default:___ `"optimized"`
 --- @field Decompile boolean -- Script decompiling. ___Default:___ true
+--- @field Decompiler any -- Which decompiler to use: `"auto"` (executor builtin, lua.expert fallback), `"builtin"` (executor only), `"luaexpert"` (https://lua.expert only), or a custom `function(script)` returning source. ___Default:___ `"auto"`
+--- @field LuaExpertURL string -- Endpoint used when Decompiler resolves to lua.expert. ___Default:___ `"https://api.lua.expert/decompile"`
+--- @field LuaExpertRateLimit number -- Minimum seconds between lua.expert requests (API allows ~500/min). ___Default:___ 0.15
 --- @field scriptcache boolean -- Use decompiled script cache to avoid decompiling duplicate scripts. ___Default:___ true
 --- @field DecompileTimeout number -- If the decompilation run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 10
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
@@ -3586,6 +3589,11 @@ end
 --- @field IgnoreDefaultPlayerScripts boolean -- * **RISKY**: Ignores Default PlayerScripts like PlayerModule & RbxCharacterSounds. Prevents crashes on some execs. ___Default:___ true
 --- @field SharedBinaryStrings boolean -- Stores BinaryString values in a shared pool so identical ones are only written once, instead of repeating them for every instance. Good when many instances hold the same data (like copies of the same mesh) -- can make files noticeably smaller. Slightly bigger when everything is unique. Roblox doesn't officially support this, so there's a small chance it confuses Studio. ___Default:___ false
 --- @field TreatUnionsAsParts boolean -- * **RISKY:** Converts all UnionOperations to Parts. Useful if your Executor isn't able to save (read) Unions, because otherwise they will be invisible. ___Default:___ false (except Solara)
+--- @field WatchNewInstances boolean -- After the main save finishes, keeps watching WatchTargets (+ nil instances) for newly-appearing assets and re-saves everything into the same file once stopped via the STOP & SAVE button or `getgenv().USSI_StopWatch()`. ___Default:___ false
+--- @field WatchTargets table -- Service names and/or Instance references to watch for new descendants. ___Default:___ `{"ServerStorage", "Workspace"}`
+--- @field WatchTimeout number -- Auto-stops watching after N seconds and re-saves. -1 watches until stopped manually. ___Default:___ -1
+--- @field WatchIncludeNil boolean -- Also polls `getnilinstances` for newly-appearing nil-parented instances while watching. ___Default:___ true
+--- @field WatchShowButton boolean -- Shows a STOP & SAVE button (with live newcomer count) next to the status text. ___Default:___ true
 
 --- @interface OptionsAliases
 --- @within SynSaveInstance
@@ -3671,6 +3679,9 @@ local function synsaveinstance(...)
 		Decompile = true,
 		DecompileTimeout = 10,
 		DecompileJobless = false,
+		Decompiler = "auto", -- "auto" | "builtin" | "luaexpert" | custom function(script) -> string. "auto" prefers the executor's built-in decompile and falls back to lua.expert (needs getscriptbytecode + http request).
+		LuaExpertURL = "https://api.lua.expert/decompile",
+		LuaExpertRateLimit = 0.15, -- Minimum seconds between lua.expert requests (500 req/min limit).
 		-- decomptype = "",
 		scriptcache = true,
 		SaveBytecode = false,
@@ -3757,6 +3768,11 @@ local function synsaveinstance(...)
 		},
 		SharedBinaryStrings = false,
 		TreatUnionsAsParts = false,
+		WatchNewInstances = false, -- After the main save finishes, keep watching for newly-appearing instances (e.g. ServerStorage assets moved to Workspace) and re-save everything on stop.
+		WatchTargets = { "ServerStorage", "Workspace" }, -- Service names and/or Instance references to watch for new descendants.
+		WatchTimeout = -1, -- Auto-stop watching after N seconds. -1 disables (watch until stopped manually).
+		WatchIncludeNil = true, -- Also poll getnilinstances for newly-appearing nil-parented instances while watching.
+		WatchShowButton = true, -- Show a STOP & SAVE button (with live newcomer count) next to the status text.
 		AlternativeWritefile = not arrayToDict({ "WRD", "Xeno", "Zorara", "OpiumwareMac" })[EXECUTOR_NAME],
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
@@ -4450,14 +4466,150 @@ local function synsaveinstance(...)
 		end
 	end
 
+	local http_request_fn = (syn and syn.request) or (http and http.request) or http_request
+		or (fluxus and fluxus.request) or request
+
+	local luaexpert_last_call = 0
+	local luaExpertB64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local function luaExpertB64Fallback(data)
+		local len = #data
+		local buffer = table.create(math.ceil(len / 3) * 4)
+		local n = 0
+		for i = 1, len, 3 do
+			local b1 = string.byte(data, i)
+			local b2 = string.byte(data, i + 1)
+			local b3 = string.byte(data, i + 2)
+			n += 1
+			buffer[n] = string.sub(luaExpertB64Chars, math.floor(b1 / 4) + 1, math.floor(b1 / 4) + 1)
+			n += 1
+			if b2 then
+				buffer[n] = string.sub(
+					luaExpertB64Chars,
+					(b1 % 4) * 16 + math.floor(b2 / 16) + 1,
+					(b1 % 4) * 16 + math.floor(b2 / 16) + 1
+				)
+				n += 1
+				if b3 then
+					buffer[n] = string.sub(
+						luaExpertB64Chars,
+						(b2 % 16) * 4 + math.floor(b3 / 64) + 1,
+						(b2 % 16) * 4 + math.floor(b3 / 64) + 1
+					)
+					n += 1
+					buffer[n] = string.sub(luaExpertB64Chars, (b3 % 64) + 1, (b3 % 64) + 1)
+				else
+					buffer[n] = string.sub(luaExpertB64Chars, (b2 % 16) * 4 + 1, (b2 % 16) * 4 + 1)
+					n += 1
+					buffer[n] = "="
+				end
+			else
+				buffer[n] = string.sub(luaExpertB64Chars, (b1 % 4) * 16 + 1, (b1 % 4) * 16 + 1)
+				n += 1
+				buffer[n] = "=="
+			end
+		end
+		return table.concat(buffer)
+	end
+
+	local function luaExpertDecompile(scriptInstance)
+		if not getscriptbytecode then
+			return "-- lua.expert: 'getscriptbytecode' is not supported by your executor!"
+		end
+		if not http_request_fn then
+			return "-- lua.expert: HTTP request function is not supported by your executor!"
+		end
+
+		local success, bytecode = pcall(getscriptbytecode, scriptInstance)
+		if not success or not bytecode or #bytecode == 0 then
+			return "-- lua.expert: Failed to retrieve script bytecode"
+		end
+
+		-- Rate limiting: lua.expert allows up to ~500 requests/minute
+		local rateLimit = tonumber(OPTIONS.LuaExpertRateLimit) or 0.15
+		local elapsed = os.clock() - luaexpert_last_call
+		if elapsed < rateLimit then
+			task.wait(rateLimit - elapsed)
+		end
+
+		local encode = base64encode or luaExpertB64Fallback
+		local okEncode, jsonPayload =
+			pcall(service.HttpService.JSONEncode, service.HttpService, { script = encode(bytecode) })
+		if not okEncode then
+			return "-- lua.expert: Failed to JSON-encode payload"
+		end
+
+		local reqOk, httpResult = pcall(http_request_fn, {
+			Url = OPTIONS.LuaExpertURL or "https://api.lua.expert/decompile",
+			Method = "POST",
+			Headers = {
+				["Content-Type"] = "application/json",
+			},
+			Body = jsonPayload,
+		})
+
+		luaexpert_last_call = os.clock()
+
+		if not reqOk or not httpResult then
+			return "-- lua.expert: request failed: " .. tostring(httpResult)
+		end
+
+		local body = httpResult.Body or httpResult.body or httpResult
+		local status = httpResult.StatusCode or httpResult.Status_Code
+		if status ~= nil and tonumber(status) ~= 200 then
+			return "-- lua.expert decompile error (" .. tostring(status) .. "): " .. tostring(body)
+		end
+		if type(body) ~= "string" then
+			return "-- lua.expert: unexpected response type: " .. typeof(body)
+		end
+
+		return body
+	end
+
+	local function resolveDecompiler()
+		local opt = OPTIONS.Decompiler
+		if type(opt) == "function" then
+			return opt, "custom"
+		end
+		if type(opt) == "string" then
+			local lowered = string.lower(opt)
+			if lowered == "luaexpert" or lowered == "lua.expert" then
+				if getscriptbytecode and http_request_fn then
+					return luaExpertDecompile, "lua.expert"
+				end
+				return nil, "lua.expert (unavailable: needs getscriptbytecode + http request)"
+			elseif lowered == "builtin" or lowered == "executor" then
+				return decompile, "builtin"
+			end
+		end
+		-- "auto": prefer the executor's built-in decompiler, fall back to lua.expert
+		if decompile then
+			return decompile, "builtin"
+		end
+		if getscriptbytecode and http_request_fn then
+			return luaExpertDecompile, "lua.expert"
+		end
+		return nil, "none"
+	end
+
 	if not OPTIONS.Decompile then
 		ldecompile = function()
 			return "-- Decompiling is disabled"
 		end
-	elseif decompile then
-		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
+	else
+		local decompilerFn, decompilerLabel = resolveDecompiler()
+		if not decompilerFn then
+			ldecompile = function()
+				return "-- Your Executor does NOT have a Decompiler (and lua.expert fallback is unavailable: needs getscriptbytecode + http request; [" .. tostring(
+					decompilerLabel
+				) .. "])"
+			end
+		else
+			if __DEBUG_MODE then
+				__DEBUG_MODE("Using decompiler: " .. tostring(decompilerLabel))
+			end
+			local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompilerFn, "Decompiler timed out")
 
-		ldecompile = function(script)
+			ldecompile = function(script)
 			-- local name = scr.ClassName .. scr.Name
 			local bytecode
 			if ScriptCache then
@@ -4512,9 +4664,6 @@ local function synsaveinstance(...)
 
 			return output
 		end
-	else
-		ldecompile = function()
-			return "-- Your Executor does NOT have a Decompiler"
 		end
 	end
 
@@ -6623,6 +6772,177 @@ local function synsaveinstance(...)
 	local ok, err = xpcall(save_game, function(err)
 		return debug.traceback(err)
 	end)
+
+	-- Live ServerStorage/Workspace saver: after the main save finishes, keep
+	-- watching for newly-appearing instances and re-save everything on stop.
+	if ok and OPTIONS.WatchNewInstances then
+		local watchOk, watchErr = xpcall(function()
+			local targets = {}
+			local configured = OPTIONS.WatchTargets
+			if typeof(configured) == "Instance" then
+				configured = { configured }
+			elseif type(configured) ~= "table" then
+				configured = { "ServerStorage", "Workspace" }
+			end
+			for _, target in configured do
+				if typeof(target) == "Instance" then
+					targets[#targets + 1] = target
+				elseif type(target) == "string" then
+					local okFind, found = pcall(function()
+						return game:FindService(target) or game:FindFirstChild(target)
+					end)
+					if okFind and found then
+						targets[#targets + 1] = found
+					end
+				end
+			end
+			if #targets == 0 then
+				for _, name in { "ServerStorage", "Workspace" } do
+					local found = game:FindService(name)
+					if found then
+						targets[#targets + 1] = found
+					end
+				end
+			end
+
+			local watchedSet, watchedRoots, watchedCount = {}, {}, 0
+			local stopFlag = false
+
+			local function track(instance)
+				if watchedSet[instance] then
+					return
+				end
+				-- Skip descendants of an already-tracked root (bulk model adds
+				-- fire DescendantAdded once per descendant).
+				local ancestor = instance.Parent
+				while typeof(ancestor) == "Instance" do
+					if watchedSet[ancestor] then
+						return
+					end
+					ancestor = ancestor.Parent
+				end
+				watchedSet[instance] = true
+				watchedRoots[#watchedRoots + 1] = instance
+				watchedCount += 1
+			end
+
+			for _, target in targets do
+				pcall(function()
+					Connect(target.DescendantAdded, track)
+				end)
+			end
+
+			-- Snapshot current nil instances so only *new* ones are tracked.
+			local initialNils = {}
+			local canPollNil = OPTIONS.WatchIncludeNil and global_container.getnilinstances
+			if canPollNil then
+				local okNil, nils = pcall(global_container.getnilinstances)
+				if okNil and type(nils) == "table" then
+					for _, instance in nils do
+						initialNils[instance] = true
+					end
+				end
+			end
+
+			GLOBAL_ENV.USSI_StopWatch = function()
+				stopFlag = true
+			end
+			GLOBAL_ENV.USSI_WatchedCount = function()
+				return watchedCount
+			end
+
+			local stopButton
+			local statusGui = GLOBAL_ENV.USSI_statustext
+			if OPTIONS.WatchShowButton and StatusText and statusGui then
+				stopButton = Instance.new("TextButton")
+				stopButton.Name = "USSI_StopWatch"
+				stopButton.AnchorPoint = Vector2.new(1, 0)
+				stopButton.Position = UDim2.new(1, 0, 0, 22)
+				stopButton.Size = UDim2.new(0.3, 0, 0, 22)
+				stopButton.Font = Enum.Font.Code
+				stopButton.TextScaled = true
+				stopButton.BackgroundColor3 = Color3.new(0.6, 0.15, 0.15)
+				stopButton.TextColor3 = Color3.new(1, 1, 1)
+				stopButton.TextStrokeTransparency = 0.7
+				stopButton.Text = "STOP & SAVE (0 new)"
+				stopButton.Parent = statusGui
+				Connect(stopButton.MouseButton1Click, function()
+					stopFlag = true
+				end)
+			end
+
+			local function refreshUI()
+				if stopButton then
+					stopButton.Text = "STOP & SAVE (" .. watchedCount .. " new)"
+				end
+				if StatusText then
+					StatusText.Text = "Watching for new assets... (" .. watchedCount .. " new) | STOP & SAVE button or USSI_StopWatch()"
+				end
+			end
+
+			if StatusText then
+				StatusText.TextColor3 = Color3.new(1, 1, 0.6)
+			end
+			refreshUI()
+
+			local watchStart = os.clock()
+			local timeout = tonumber(OPTIONS.WatchTimeout) or -1
+			local lastNilPoll = 0
+			while not stopFlag do
+				task.wait(0.5)
+				if canPollNil and os.clock() - lastNilPoll > 2 then
+					lastNilPoll = os.clock()
+					local okNil, nils = pcall(global_container.getnilinstances)
+					if okNil and type(nils) == "table" then
+						for _, instance in nils do
+							if not initialNils[instance] then
+								track(instance)
+							end
+						end
+					end
+				end
+				refreshUI()
+				if timeout > 0 and os.clock() - watchStart > timeout then
+					break
+				end
+			end
+
+			if stopButton then
+				pcall(function()
+					stopButton:Destroy()
+				end)
+			end
+			GLOBAL_ENV.USSI_StopWatch = nil
+			GLOBAL_ENV.USSI_WatchedCount = nil
+
+			if watchedCount > 0 then
+				if StatusText then
+					StatusText.Text = "Re-saving with " .. watchedCount .. " watched instances..."
+					StatusText.TextColor3 = Color3.new(1, 1, 1)
+				end
+				-- Tracked roots are usually already covered by the main roots
+				-- (collect dedupes), this only matters for Object/invalid modes
+				-- where a watched target wasn't part of the original save.
+				for _, root in watchedRoots do
+					table.insert(ToSaveList, root)
+				end
+				elapse_t = os.clock()
+				totalsize = 0 -- reset so the final size message reflects the re-save
+				local ok2, err2 = xpcall(save_game, function(err)
+					return debug.traceback(err)
+				end)
+				ok, err = ok2, err2
+			elseif StatusText then
+				StatusText.TextColor3 = Color3.new(1, 1, 1)
+			end
+		end, function(err)
+			return debug.traceback(err)
+		end)
+		if not watchOk then
+			warn("[USSI Watch] Watcher error (main save is intact):")
+			warn(watchErr)
+		end
+	end
 
 	if OPTIONS.BoostFPS then
 		pcall(function()
