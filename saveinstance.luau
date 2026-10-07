@@ -5078,6 +5078,9 @@ local function synsaveinstance(...)
 		local entries, classList = ctx.entries, ctx.classList
 		local ordered, refs = ctx.ordered, ctx.refs
 
+		-- Classes Studio rejects even as genuine game children.
+		local NEVER_UNDER_GAME = { UserGameSettings = true }
+
 		local function recur(instance, parent, ldIgnore)
 			if entries[instance] then
 				return -- already collected via another root
@@ -5150,6 +5153,29 @@ local function synsaveinstance(...)
 				end
 			elseif tagOverride == "Folder" then
 				propClass = "Instance"
+			end
+
+			-- Services emitted as top-level roots land directly under Game
+			-- (DataModel) on load. Studio rejects services that can't live
+			-- there (e.g. "UserGameSettings cannot be parented to Game"),
+			-- making the whole file unopenable. Genuine game children are
+			-- fine; anything else (ExtraInstances/Object pointing at a
+			-- foreign service, executor quirks) is skipped instead.
+			-- NOTE: only the emitted tag matters -- instances remapped to
+			-- Folder (NotCreatableFixes, Isolate*) are safe by construction.
+			-- NEVER_UNDER_GAME covers classes Studio rejects even as genuine
+			-- game children.
+			if parent == nil and virtual == nil and not (override and override.__Synthetic) then
+				local topTag = unknownTag or tagOverride or class
+				local topInfo = ClassList[topTag]
+				local forbidden = NEVER_UNDER_GAME[topTag]
+					or (topInfo and topInfo.Service and instance.Parent ~= game)
+				if forbidden then
+					if __DEBUG_MODE then
+						__DEBUG_MODE("Skipping service not parentable to Game", topTag, instance:GetFullName())
+					end
+					return
+				end
 			end
 
 			local e = {
